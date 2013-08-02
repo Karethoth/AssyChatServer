@@ -1,8 +1,11 @@
 package main
 
 import (
+  "code.google.com/p/go.net/websocket"
   "container/list"
   "sync/atomic"
+  "net/http"
+  "runtime"
   "strings"
   "bufio"
   "time"
@@ -18,12 +21,20 @@ var allowedRanges = []string{
   "85.188.32.0/19",
 }
 
+func RoomInfoUpdater( chatRoom *ChatRoom ) {
+  for {
+    runtime.GC()
+    fmt.Printf( "Goroutines: %d\n", runtime.NumGoroutine() )
+    time.Sleep( 1 * time.Second )
+  }
+}
+
 func MessageRemover( messageBuffer *[]*Message ) {
   for {
     if len( *messageBuffer ) > 50 {
       *messageBuffer = (*messageBuffer)[len( *messageBuffer )-49:]
     }
-    time.Sleep( 500 )
+    time.Sleep( 200 * time.Millisecond )
   }
 }
 
@@ -47,7 +58,7 @@ type Client struct {
   userClass int
   incoming chan string
   outgoing chan string
-  quit chan bool
+  quit bool
   reader *bufio.Reader
   writer *bufio.Writer
 }
@@ -55,19 +66,32 @@ type Client struct {
 func (client *Client) Read() {
   for {
     line, err := client.reader.ReadString('\n')
-    fmt.Printf( "Received: '%s'\n", line )
     if err != nil {
-      client.quit <- true
+      client.quit = true
       return
     }
-    client.incoming <- line
+
+    select {
+      case client.incoming <- line:
+        continue
+      case <-time.After( 1 * time.Second ):
+        break
+    }
   }
 }
 
 func (client *Client) Write() {
-  for data := range client.outgoing {
-    client.writer.WriteString(data)
-    client.writer.Flush()
+  for {
+    if client.quit {
+      return
+    }
+    select {
+      case data := <-client.outgoing:
+        client.writer.WriteString(data)
+        client.writer.Flush()
+      case <-time.After( 1 * time.Second ):
+        break
+    }
   }
 }
 
@@ -77,7 +101,11 @@ func (client *Client) Listen() {
 }
 
 func NewClient(connection net.Conn) *Client {
-  if !IPAllowed( strings.Split(connection.RemoteAddr().String(), ":")[0] ) {
+  userClass := 0
+
+  if IPAllowed( strings.Split(connection.RemoteAddr().String(), ":")[0] ) {
+    userClass = 1
+  } else {
     connection.Close()
     return nil
   }
@@ -90,9 +118,10 @@ func NewClient(connection net.Conn) *Client {
     ipString: connection.RemoteAddr().String(),
     incoming: make(chan string),
     outgoing: make(chan string),
-    quit: make(chan bool),
+    quit: false,
     reader: reader,
     writer: writer,
+    userClass: userClass,
   }
 
   client.Listen()
@@ -100,7 +129,9 @@ func NewClient(connection net.Conn) *Client {
 }
 
 func ClientCloser( client *Client, chatRoom *ChatRoom ) {
-  <-client.quit
+  for !client.quit {
+    time.Sleep( 100 * time.Millisecond )
+  }
   chatRoom.RemoveClient( client )
 }
 
@@ -131,16 +162,28 @@ type ChatRoom struct {
 }
 
 func (chatRoom *ChatRoom) RemoveClient( client *Client ) {
+  fmt.Println( "Removing client." )
   for it := chatRoom.clients.Front(); it != nil; it = it.Next() {
     if it.Value.(*Client) == client {
-      chatRoom.clients.Remove( it )
+      if it.Value.(*Client).id == client.id {
+        chatRoom.clients.Remove( it )
+        fmt.Println( "Client removed." )
+      }
     }
   }
 }
 
 func (chatRoom *ChatRoom) Broadcast(data string) {
   for it := chatRoom.clients.Front(); it != nil; it = it.Next() {
-    it.Value.(*Client).outgoing <- data
+    if it.Value.(*Client).quit {
+      continue
+    }
+    select {
+      case it.Value.(*Client).outgoing <- data:
+        continue
+      case <-time.After( 10 * time.Second ):
+        continue
+    }
   }
 }
 
@@ -161,16 +204,30 @@ func (chatRoom *ChatRoom) Join(connection net.Conn) {
 
   chatRoom.clients.PushBack(client)
 
-  var msg string
-
   go func() {
     for {
-      msg = <-client.incoming
-      newMessage := NewMessage( client, msg )
-      chatRoom.incoming <- msg
-      chatRoom.messages = append( chatRoom.messages, newMessage )
+      if client.quit {
+        return
+      }
+
+      select {
+        case msg := <-client.incoming:
+          newMessage := NewMessage( client, msg )
+          chatRoom.HandleMessage( newMessage )
+        case <-time.After( 1 * time.Second ):
+          if client.quit {
+            return
+          }
+      }
     }
   }()
+
+  fmt.Println( "Client joined." )
+}
+
+func (chatRoom *ChatRoom) HandleMessage( msg *Message ) {
+  chatRoom.incoming <- msg.message
+  chatRoom.messages = append( chatRoom.messages, msg )
 }
 
 func (chatRoom *ChatRoom) Listen() {
@@ -196,6 +253,7 @@ func NewChatRoom() *ChatRoom {
   }
 
   go MessageRemover( &chatRoom.messages )
+  go RoomInfoUpdater( chatRoom )
 
   chatRoom.Listen()
   return chatRoom
