@@ -8,7 +8,6 @@ import (
   "net/http"
   "runtime"
   "strings"
-  "strconv"
   "bytes"
   "bufio"
   "time"
@@ -16,11 +15,6 @@ import (
   "net"
   "fmt"
 )
-
-var waitTime time.Duration
-var motd string
-var moderation bool
-var passw string
 
 var userIdCounter uint64
 var messageIdCounter uint64
@@ -34,7 +28,7 @@ var messageTimeLog map[string]time.Time
 func MessageTimeOK( msg *Message ) bool {
   ip := strings.Split( msg.sender.ipString, ":" )[0]
 
-  if time.Since( messageTimeLog[ip] ) < waitTime * time.Second {
+  if time.Since( messageTimeLog[ip] ) < 60 * time.Second {
     return false
   }
   messageTimeLog[ip] = time.Now()
@@ -54,29 +48,23 @@ func ConnectionAlive( conn *websocket.Conn ) bool {
 func RoomInfoUpdater( chatRoom *ChatRoom ) {
   for {
     runtime.GC()
-    fmt.Printf( "================\n" )
-    fmt.Printf( "Users:      %d\n", chatRoom.clients.Len() )
-    fmt.Printf( "Messages:   %d\n", chatRoom.messages.Len() )
     fmt.Printf( "Goroutines: %d\n", runtime.NumGoroutine() )
+    fmt.Printf( "Users:      %d\n", chatRoom.clients.Len() )
+    fmt.Printf( "Messages:   %d\n", len(chatRoom.messages) )
     time.Sleep( 1 * time.Second )
   }
 }
 
-func MessageRemover( messageBuffer *list.List ) {
+func MessageRemover( messageBuffer *[]*Message ) {
   for {
-    for {
-      if messageBuffer.Len() <= 5000 {
-        break
-      }
-      messageBuffer.Remove( messageBuffer.Front() )
+    if len( *messageBuffer ) > 50 {
+      *messageBuffer = (*messageBuffer)[len( *messageBuffer )-49:]
     }
     time.Sleep( 200 * time.Millisecond )
   }
 }
 
 func IPAllowed(ip string) bool {
-  return true
-
   for _, it := range allowedRanges {
     _, cidrnet, err := net.ParseCIDR(it)
     if err != nil {
@@ -180,19 +168,12 @@ func ClientCloser( client *Client, chatRoom *ChatRoom ) {
   }
 }
 
-type UserCommand struct {
-  Command string
-  Data string
-}
-
 type Message struct {
   Id uint64
   sender *Client
-  SenderClass int
   PostTime int64
   AcceptionTime int64
   Message string
-  originalMessage string
   length int
 }
 
@@ -200,7 +181,6 @@ func NewMessage( client *Client, msg string ) *Message {
   message := &Message{
     Id: 0,
     sender: client,
-    SenderClass: client.userClass,
     AcceptionTime: 0,
     Message: html.EscapeString( msg ),
     length: len(msg),
@@ -210,7 +190,7 @@ func NewMessage( client *Client, msg string ) *Message {
 
 type ChatRoom struct {
   clients  *list.List
-  messages *list.List
+  messages []*Message
   joins chan websocket.Conn
   incoming chan string
   outgoing chan string
@@ -233,7 +213,6 @@ func (chatRoom *ChatRoom) Broadcast(data string) {
     if it.Value.(*Client).quit {
       continue
     }
-
     select {
       case it.Value.(*Client).outgoing <- data:
         continue
@@ -254,26 +233,8 @@ func (chatRoom *ChatRoom) Join(connection websocket.Conn) {
   go ClientCloser( client, chatRoom )
 
   go func() {
-    it := chatRoom.messages.Back();
-    counter := 0
-    for ; it != nil; it = it.Prev() {
-      if it.Value.(*Message).AcceptionTime != 0 {
-        counter += 1
-        if counter >= 60 {
-          break
-        }
-      }
-    }
-
-    if it == nil {
-      it = chatRoom.messages.Front()
-    }
-
-    for ; it != nil; it = it.Next() {
-      msg := it.Value.(*Message)
-      if msg.AcceptionTime != 0 {
-        client.outgoing <- msg.Message
-      }
+    for _, msg := range chatRoom.messages {
+      client.outgoing <- msg.Message
     }
   }()
 
@@ -297,171 +258,45 @@ func (chatRoom *ChatRoom) Join(connection websocket.Conn) {
     }
   }()
 
-  go SendCommandToClient( client, "motd", motd )
-
   fmt.Println( "Client connected succesfully." )
 }
 
-func SendCommandToClient( client *Client, command, data string ) {
-  cmd := UserCommand{ command, data };
-  tmpJson, _ := json.Marshal( cmd )
-  client.outgoing <- string(tmpJson)
-}
-
-func SendCommandToRoom( chatRoom *ChatRoom, command, data string ) {
-  cmd := UserCommand{ command, data };
-  tmpJson, _ := json.Marshal( cmd )
-  chatRoom.incoming <- string(tmpJson)
-}
-
 func (chatRoom *ChatRoom) HandleMessage( msg *Message ) {
-  ignoreTimeOK := false
   if msg.sender.userClass == 0 {
-    SendCommandToClient( msg.sender, "error", "notAllowed" )
     return
   }
-  if msg.sender.userClass != 2 && msg.length > 144 || msg.length <= 5 {
-    SendCommandToClient( msg.sender, "error", "tooLong" )
+  if msg.length > 144 || msg.length <= 5 {
     return
   }
   if !strings.HasPrefix( msg.Message, "MSG:" ) && msg.sender.userClass != 2 {
     if !strings.HasPrefix( msg.Message, "login:" ) {
       return
     }
-    if strings.Split( msg.Message, ":" )[1] != passw {
-      SendCommandToClient( msg.sender, "mod", "false" )
+    if strings.Split( msg.Message, ":" )[1] != "passu\n" {
       return
     }
-    
     msg.sender.userClass = 2
-    SendCommandToClient( msg.sender, "mod", "true" )
 
-    go func() {
-      for it := chatRoom.messages.Front(); it != nil; it = it.Next() {
-        itmsg := it.Value.(*Message)
-        if itmsg.AcceptionTime == 0 {
-          msg.sender.outgoing <- itmsg.Message
-        }
-      }
+    // TÄHÄN MODEVIESTIEN LÄHETYS MODELLE
 
-      SendCommandToClient( msg.sender, "info", "bufferSent" )
-    }()
     return
-
-  } else if strings.HasPrefix( msg.Message, "accept:" ) {
+  } else if strings.HasPrefix( msg.Message, "forget:" ) {
     idString := strings.Split( msg.Message, ":" )[1]
     idString = strings.Split( idString, "\n" )[0]
-    id, _ := strconv.Atoi( idString )
-    for it := chatRoom.messages.Front(); it != nil; it = it.Next() {
-      itMsg := it.Value.(*Message)
-      if itMsg.Id == uint64(id) {
-        if itMsg.AcceptionTime != 0 {
-          return
-        }
-        msg = NewMessage( msg.sender, itMsg.originalMessage[4:] )
-        msg.AcceptionTime = time.Now().Unix()
-        msg.PostTime = itMsg.PostTime
-        msg.Id = itMsg.Id
-        msg.sender = itMsg.sender
-        msg.SenderClass = itMsg.sender.userClass
-        ignoreTimeOK = true
-        tmpJson, _ := json.Marshal( msg )
-        msg.Message = string(tmpJson)
-        chatRoom.messages.Remove( it )
-        chatRoom.messages.PushBack( msg )
-        chatRoom.incoming <- msg.Message
-        break
-      }
-    }
-    return
-  } else if strings.HasPrefix( msg.Message, "delete:" ) {
-    idString := strings.Split( msg.Message, ":" )[1]
-    idString = strings.Split( idString, "\n" )[0]
-    id, _ := strconv.Atoi( idString )
-    for it := chatRoom.messages.Front(); it != nil; it = it.Next() {
-      itMsg := it.Value.(*Message)
-      if itMsg.Id == uint64(id) {
-        chatRoom.messages.Remove( it )
-        msg = NewMessage( msg.sender, "" )
-        msg.PostTime = itMsg.PostTime
-        msg.Id = itMsg.Id
-        msg.sender = itMsg.sender
-        ignoreTimeOK = true
-        tmpJson, _ := json.Marshal( msg )
-        msg.Message = string(tmpJson)
-        chatRoom.messages.Remove( it )
-        chatRoom.incoming <- msg.Message
-        break
-      }
-    }
-    return
-  } else if strings.HasPrefix( msg.Message, "motd:" ) {
-    motd = msg.Message[5:]
-    go SendCommandToRoom( chatRoom, "motd", motd )
-    return
-  } else if strings.HasPrefix( msg.Message, "moderation:" ) {
-    boolString := strings.Split( msg.Message, ":" )[1]
-    boolString = strings.Split( boolString, "\n" )[0]
-    if bytes.Equal( []byte(boolString), []byte("true") ) {
-      moderation = true
-    } else if bytes.Equal( []byte(boolString), []byte("false") ) {
-      moderation = false
-    }
-    return
-  } else if strings.HasPrefix( msg.Message, "reload" ) {
-    go SendCommandToRoom( chatRoom, "reload", "nao" )
-    return
-  } else if strings.HasPrefix( msg.Message, "wait:" ) {
-    wait := strings.Split( msg.Message, ":" )[1]
-    wait = strings.Split( wait, "\n" )[0]
-    tmpWait ,_ := strconv.Atoi( wait )
-    waitTime = time.Duration( tmpWait )
-    fmt.Println( int(waitTime) )
-    return
-  } else if !strings.HasPrefix( msg.Message, "MSG:" ) {
-    go SendCommandToClient( msg.sender, "error", "notAllowed" )
+    fmt.Println( idString )
+  }
+  if !MessageTimeOK( msg ) {
     return
   }
-
-  if msg.sender.userClass == 2 {
-    ignoreTimeOK = true
-    go SendCommandToClient( msg.sender, "wait", "0" )
-  }
-  if !ignoreTimeOK && !MessageTimeOK( msg ) {
-    go SendCommandToClient( msg.sender, "error", "tooFast" )
-    return
-  }
-
   msg.Id = atomic.AddUint64( &messageIdCounter, 1 )
   msg.PostTime = time.Now().Unix()
-  if !moderation || msg.sender.userClass == 2 {
-    msg.AcceptionTime = time.Now().Unix()
-  }
 
-  go SendCommandToClient( msg.sender, "wait", strconv.Itoa( int(waitTime) ) )
-
-  msg.originalMessage = msg.Message
-  msg.Message = msg.Message[4:]
   tmpJson, _ := json.Marshal( msg )
   msg.Message = string(tmpJson)
 
   msg.sender.msgSent = time.Now()
-  chatRoom.messages.PushBack( msg )
-  if msg.AcceptionTime != 0 {
-    chatRoom.incoming <- msg.Message
-  } else {
-    for it := chatRoom.clients.Front(); it != nil; it = it.Next() {
-      if it.Value.(*Client).userClass != 2 {
-        continue
-      }
-      select {
-        case it.Value.(*Client).outgoing <- msg.Message:
-          continue
-        case <-time.After( 10 * time.Second ):
-          continue
-      }
-    }
-  }
+  chatRoom.incoming <- msg.Message
+  chatRoom.messages = append( chatRoom.messages, msg )
 }
 
 func (chatRoom *ChatRoom) Listen() {
@@ -480,13 +315,13 @@ func (chatRoom *ChatRoom) Listen() {
 func NewChatRoom() *ChatRoom {
   chatRoom := &ChatRoom{
     clients: list.New(),
-    messages: list.New(),
+    messages: make([]*Message, 0),
     joins: make(chan websocket.Conn),
     incoming: make(chan string),
     outgoing: make(chan string),
   }
 
-  go MessageRemover( chatRoom.messages )
+  go MessageRemover( &chatRoom.messages )
   go RoomInfoUpdater( chatRoom )
 
   chatRoom.Listen()
@@ -504,10 +339,6 @@ func ChatServer( ws *websocket.Conn ) {
 }
 
 func main() {
-  moderation = true
-  motd = "AssyChat"
-  passw = "JouluinenPukki_321\n"
-  waitTime = 10
   messageTimeLog = make(map[string]time.Time)
   mainRoom = NewChatRoom()
 
